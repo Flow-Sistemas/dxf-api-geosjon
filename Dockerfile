@@ -3,13 +3,16 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Use GDAL from Debian repos, including the Python bindings (python3-gdal).
-# This avoids compiling GDAL from source via pip (which often fails on slim images).
+# GDAL + bindings Python do Debian (evita compilação via pip)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gdal-bin libgdal-dev python3-gdal curl ca-certificates \
+    gdal-bin libgdal-dev python3-gdal proj-bin curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Install only the app deps via pip (no GDAL here).
+# O módulo 'osgeo' instalado via apt fica em /usr/lib/python3/dist-packages
+# Adicionamos esse caminho ao PYTHONPATH para que o Python do container (em /usr/local) encontre o pacote.
+ENV PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH
+
+# Dependências Python da aplicação
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir fastapi uvicorn[standard] pydantic
 
