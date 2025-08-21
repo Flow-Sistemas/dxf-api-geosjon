@@ -7,14 +7,9 @@ from typing import Optional, Literal, Dict, Any, List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, constr
 
-# GDAL / OGR
-from osgeo import ogr, osr, gdal
+app = FastAPI(title="DXF → GeoJSON API", version="1.1.0", docs_url="/docs", redoc_url="/redoc")
 
-app = FastAPI(title="DXF → GeoJSON API", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
-
-# Tornar erros do GDAL mais verbosos em logs
-gdal.UseExceptions()
-
+# ---------- Modelos ----------
 
 class ConvertRequest(BaseModel):
     dxf_base64: constr(strip_whitespace=True, min_length=1) = Field(..., description="Conteúdo DXF em base64")
@@ -25,34 +20,39 @@ class ConvertRequest(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: Literal["ok"]
-    gdal_version: str
-    ogr_drivers: List[str]
+    status: Literal["ok", "degraded"]
+    gdal_version: Optional[str] = None
+    ogr_drivers: List[str] = []
+    error: Optional[str] = None
 
 
-def _build_coord_transform(source_epsg: Optional[str], target_epsg: Optional[str]):
+# ---------- Util ----------
+
+def _load_osgeo():
     """
-    Cria um transformador de coordenadas OGR/OSR.
-    Retorna (transform, src_srs, dst_srs), ou (None, None, None) se não houver reprojeção.
+    Importa GDAL/OGR sob demanda, para evitar crash no boot se os bindings não estiverem presentes.
     """
+    try:
+        from osgeo import ogr, osr, gdal  # type: ignore
+        gdal.UseExceptions()
+        return ogr, osr, gdal
+    except Exception as e:
+        raise RuntimeError(f"GDAL/OGR indisponível: {e}")
+
+def _build_coord_transform(osr, source_epsg: Optional[str], target_epsg: Optional[str]):
     if not source_epsg or not target_epsg or source_epsg == target_epsg:
         return None, None, None
-
     src_srs = osr.SpatialReference()
     if src_srs.SetFromUserInput(source_epsg) != 0:
         raise ValueError(f"Não foi possível interpretar source_crs: {source_epsg}")
-
     dst_srs = osr.SpatialReference()
     if dst_srs.SetFromUserInput(target_epsg) != 0:
         raise ValueError(f"Não foi possível interpretar target_crs: {target_epsg}")
-
     transform = osr.CoordinateTransformation(src_srs, dst_srs)
     return transform, src_srs, dst_srs
 
-
-def _feature_properties(feat: ogr.Feature, include_ogr_fields: bool) -> Dict[str, Any]:
+def _feature_properties(ogr, feat, include_ogr_fields: bool) -> Dict[str, Any]:
     props: Dict[str, Any] = {}
-
     if include_ogr_fields:
         defn = feat.GetDefnRef()
         for i in range(defn.GetFieldCount()):
@@ -62,54 +62,43 @@ def _feature_properties(feat: ogr.Feature, include_ogr_fields: bool) -> Dict[str
             if isinstance(val, bytes):
                 val = val.decode(errors="ignore")
             props[name] = val
-
     layer_name = feat.GetDefnRef().GetName() if feat.GetDefnRef() else None
     if layer_name and "layer" not in props:
         props["layer"] = layer_name
-
     for key in ("Text", "MTEXT", "TEXT", "MText"):
         if feat.GetFieldIndex(key) != -1 and key not in props:
             props[key] = feat.GetField(key)
-
     return props
 
-
-def _export_geom(geom: ogr.Geometry, transform: Optional[osr.CoordinateTransformation]) -> Optional[Dict[str, Any]]:
+def _export_geom(gdal, osr, geom, transform):
     if geom is None:
         return None
     geom_clone = geom.Clone()
-
     if transform is not None:
         try:
             geom_clone.Transform(transform)
         except Exception:
             return None
-
     try:
         geom_json = json.loads(geom_clone.ExportToJson())
         return geom_json
     except Exception:
         return None
 
-
-def _collect_layers_as_features(ds: ogr.DataSource,
-                                transform: Optional[osr.CoordinateTransformation],
-                                include_ogr_fields: bool) -> List[Dict[str, Any]]:
+def _collect_layers_as_features(ogr, gdal, osr, ds, transform, include_ogr_fields: bool):
     features: List[Dict[str, Any]] = []
     for i in range(ds.GetLayerCount()):
         layer = ds.GetLayerByIndex(i)
         if layer is None:
             continue
-
         layer.ResetReading()
         for feat in layer:
             try:
                 geom = feat.GetGeometryRef()
-                gj = _export_geom(geom, transform)
+                gj = _export_geom(gdal, osr, geom, transform)
                 if gj is None:
                     continue
-
-                props = _feature_properties(feat, include_ogr_fields)
+                props = _feature_properties(ogr, feat, include_ogr_fields)
                 features.append({
                     "type": "Feature",
                     "geometry": gj,
@@ -119,11 +108,9 @@ def _collect_layers_as_features(ds: ogr.DataSource,
                 continue
     return features
 
-
-def _compute_bbox(features: List[Dict[str, Any]]) -> Optional[List[float]]:
+def _compute_bbox(features: List[Dict[str, Any]]):
     minx = miny = float("inf")
     maxx = maxy = float("-inf")
-
     def scan_coords(coords):
         nonlocal minx, miny, maxx, maxy
         if isinstance(coords[0], (float, int)):
@@ -133,7 +120,6 @@ def _compute_bbox(features: List[Dict[str, Any]]) -> Optional[List[float]]:
         else:
             for c in coords:
                 scan_coords(c)
-
     for f in features:
         geom = f.get("geometry")
         if not geom:
@@ -145,24 +131,35 @@ def _compute_bbox(features: List[Dict[str, Any]]) -> Optional[List[float]]:
             scan_coords(coords)
         except Exception:
             continue
-
     if minx is float("inf"):
         return None
     return [minx, miny, maxx, maxy]
 
 
+# ---------- Endpoints ----------
+
 @app.get("/health", response_model=HealthResponse)
 def health():
-    drivers = []
-    for i in range(ogr.GetDriverCount()):
-        drv = ogr.GetDriver(i)
-        if drv:
-            drivers.append(drv.GetName())
-    return HealthResponse(status="ok", gdal_version=gdal.VersionInfo(), ogr_drivers=drivers)
+    try:
+        ogr, osr, gdal = _load_osgeo()
+        drivers = []
+        for i in range(ogr.GetDriverCount()):
+            drv = ogr.GetDriver(i)
+            if drv:
+                drivers.append(drv.GetName())
+        return HealthResponse(status="ok", gdal_version=gdal.VersionInfo(), ogr_drivers=drivers)
+    except Exception as e:
+        # Servidor sobe mesmo sem GDAL, mas reporta "degraded"
+        return HealthResponse(status="degraded", error=str(e), ogr_drivers=[], gdal_version=None)
 
 
 @app.post("/convert")
 def convert(req: ConvertRequest):
+    try:
+        ogr, osr, gdal = _load_osgeo()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dependência GDAL/OGR indisponível no runtime: {e}")
+
     try:
         dxf_bytes = base64.b64decode(req.dxf_base64, validate=True)
     except Exception:
@@ -187,11 +184,11 @@ def convert(req: ConvertRequest):
         transform = None
         if not req.keep_original_coords and req.source_crs and req.target_crs:
             try:
-                transform, _, _ = _build_coord_transform(req.source_crs, req.target_crs)
+                transform, _, _ = _build_coord_transform(osr, req.source_crs, req.target_crs)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
 
-        features = _collect_layers_as_features(ds, transform, req.include_ogr_fields)
+        features = _collect_layers_as_features(ogr, gdal, osr, ds, transform, req.include_ogr_fields)
 
         fc: Dict[str, Any] = {
             "type": "FeatureCollection",
