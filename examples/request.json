@@ -1,0 +1,7 @@
+{
+  "dxf_base64": "<COLE_AQUI_SEU_DXF_EM_BASE64>",
+  "source_crs": "EPSG:31982",
+  "target_crs": "EPSG:4326",
+  "keep_original_coords": false,
+  "include_ogr_fields": true
+}
